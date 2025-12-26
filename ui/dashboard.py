@@ -8,6 +8,12 @@ from ui.styles import ModernStyles
 class Dashboard(QWidget):
     def __init__(self):
         super().__init__()
+        # State for minimizing unnecessary UI updates
+        self._current_bar_color = None
+        self._last_mem_details = None
+        self._refresh_counter = 0
+        self._top_process_snapshot = ([], 0)
+
         self.init_ui()
         
         # Timer for auto-refresh
@@ -101,14 +107,19 @@ class Dashboard(QWidget):
         self.refresh_stats()
 
     def refresh_stats(self):
+        # increment tick counter; used to throttle some expensive updates
+        self._refresh_counter += 1
         try:
             info = SystemInfo.get_memory_info()
-            percent = info['percent']
+            percent = int(info['percent'])
             total_gb = round(info['total'] / (1024**3), 2)
             avail_gb = round(info['available'] / (1024**3), 2)
             
-            self.mem_bar.setValue(int(percent))
-            self.mem_details.setText(f"Total: {total_gb} GB  |  Available: {avail_gb} GB")
+            self.mem_bar.setValue(percent)
+            details_text = f"Total: {total_gb} GB  |  Available: {avail_gb} GB"
+            if details_text != self._last_mem_details:
+                self.mem_details.setText(details_text)
+                self._last_mem_details = details_text
             
             # Change color if high usage
             if percent > 80:
@@ -116,22 +127,27 @@ class Dashboard(QWidget):
             else:
                 color = ModernStyles.accent_color
                 
-            self.mem_bar.setStyleSheet(f"""
-                QProgressBar {{
-                    border: 1px solid #e0e0e0;
-                    border-radius: 6px;
-                    text-align: center;
-                    height: 24px;
-                    background-color: #f0f0f0;
-                }}
-                QProgressBar::chunk {{
-                    background-color: {color};
-                    border-radius: 5px;
-                }}
-            """)
+            # Only reapply stylesheet when color actually changes (reduce repaints)
+            if color != self._current_bar_color:
+                self.mem_bar.setStyleSheet(f"""
+                    QProgressBar {{
+                        border: 1px solid #e0e0e0;
+                        border-radius: 6px;
+                        text-align: center;
+                        height: 24px;
+                        background-color: #f0f0f0;
+                    }}
+                    QProgressBar::chunk {{
+                        background-color: {color};
+                        border-radius: 5px;
+                    }}
+                """)
+                self._current_bar_color = color
             
-            # Update running apps list
-            self._update_running_apps()
+            # Update running apps list every other tick to reduce overhead.
+            # Intent: update on the 1st tick and then every 2 ticks -> ticks 1,3,5,...
+            if self._refresh_counter % 2 == 1:
+                self._update_running_apps()
             
         except Exception:
             pass
@@ -147,20 +163,34 @@ class Dashboard(QWidget):
         # Get top memory-consuming processes
         try:
             procs = []
-            for p in psutil.process_iter(['pid', 'name', 'memory_info']):
+            for p in psutil.process_iter(['name', 'memory_info'], ad_value=None):
+                # protect against processes that vanish or deny access while iterating
                 try:
-                    mem_mb = p.info['memory_info'].rss / (1024 * 1024)
+                    mem_info = p.info.get('memory_info')
+                    name = p.info.get('name')
+                    # mem_info can be None (ad_value) or name can be None/empty
+                    if mem_info is None or not name:
+                        continue
+
+                    mem_mb = mem_info.rss / (1024 * 1024)
                     if mem_mb > 10:  # Only show apps using > 10 MB
                         procs.append({
-                            'name': p.info['name'],
+                            'name': name,
                             'mem_mb': mem_mb
                         })
                 except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
-                    pass
+                    # process disappeared or cannot be accessed — skip it
+                    continue
             
             # Sort by memory and take top 10
             procs.sort(key=lambda x: x['mem_mb'], reverse=True)
             top_procs = procs[:10]
+            
+            snapshot = ([(p['name'], round(p['mem_mb'], 1)) for p in top_procs],
+                        round(sum(p['mem_mb'] for p in top_procs), 1))
+            if snapshot == self._top_process_snapshot:
+                return
+            self._top_process_snapshot = snapshot
             
             for proc in top_procs:
                 row = QWidget()
@@ -202,4 +232,3 @@ class Dashboard(QWidget):
         self.refresh_stats()
         QTimer.singleShot(2000, lambda: self.opt_btn.setText("🚀 Optimize Memory"))
         self.opt_btn.setEnabled(True)
-
